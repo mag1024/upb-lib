@@ -16,6 +16,24 @@ from .util import parse_flags, parse_url
 
 LOG = logging.getLogger(__name__)
 
+class _StaticTxPolicy:
+    def __init__(self, tx_count):
+        self.tx_count = tx_count
+    def record_success(self, network_id, upb_id):
+        pass
+    def get_tx_count(self, network_id, upb_id):
+        return self.tx_count
+
+class _LearningTxPolicy:
+    def __init__(self):
+        self._tx_counts = {}
+    def record_success(self, network_id, upb_id, tx_count):
+        if tx_count > 1:
+            LOG.debug("Increasing tx_count for %d_%d to %d" % (
+                network_id, upb_id,tx_count))
+        self._tx_counts[(network_id, upb_id)] = tx_count
+    def get_tx_count(self, network_id, upb_id):
+        return self._tx_counts.get((network_id, upb_id), 1)
 
 class UpbPim:
     """Represents all the components on an UPB PIM."""
@@ -26,7 +44,9 @@ class UpbPim:
         self.flags = parse_flags(config.get("flags", ""))
         LOG.info("Using flags: %s", str(self.flags))
         self._decoder = MessageDecode()
-        self.encoder = MessageEncode(config.get("tx_count", 1))
+        self.tx_policy = _LearningTxPolicy()
+        # self.tx_policy = StaticTxPolicy(config.get("tx_count", 1))
+        self.encoder = MessageEncode(self.tx_policy.get_tx_count)
 
         self.loop = loop if loop else asyncio.get_event_loop()
         self._config = config
@@ -52,15 +72,16 @@ class UpbPim:
         url = self._config["url"]
         LOG.info("Connecting to UPB PIM at %s", url)
         scheme, dest, param = parse_url(url)
-        heartbeat_time = self.flags.get("heartbeat_timeout_sec", 90) if scheme == "tcp" else -1
+        heartbeat_timeout_sec = self.flags.get("heartbeat_timeout_sec", 90)
         conn = partial(
             Connection,
             self.loop,
-            heartbeat_time,
-            self._connected,
-            self._disconnected,
-            self._got_data,
-            self._timeout,
+            Connection.Callbacks(
+                self._connected,
+                self._disconnected,
+                self._on_data,
+                self._on_timeout),
+            -1 # heartbeat_timeout_sec if scheme == "tcp" else -1,
         )
         try:
             if scheme == "serial":
@@ -119,12 +140,12 @@ class UpbPim:
         """Add handler for a message type."""
         self._decoder.add_handler(msg_type, handler)
 
-    def _got_data(self, data):  # pylint: disable=no-self-use
+    def _on_data(self, data):  # pylint: disable=no-self-use
         try:
             if data[:2] == "~~":
                 self._handle_control_command(data)
             else:
-                self._decoder.handle(data)
+                self.tx_policy.record_success(*self._decoder.decode(data))
         except (ValueError, AttributeError) as err:
             LOG.debug(err)
 
@@ -146,20 +167,21 @@ class UpbPim:
         self.links.connection_status_change(status)
         self._decoder.call_handlers(status, {})
 
-    def _timeout(self, kind, addr):
+    def _on_timeout(self, kind, addr):
         if kind == "PIM":
             LOG.warning("Timeout communicating with PIM, is it connected?")
+            return
+
+        device_id = UpbAddr(int(addr[0:2], 16), int(addr[2:4], 16), 0).index
+        device = self.devices.elements.get(device_id)
+        if device:
+            LOG.warning(
+                "Timeout communicating with UPB device '%s' (%s)",
+                device.name,
+                device_id,
+            )
         else:
-            device_id = UpbAddr(int(addr[0:2], 16), int(addr[2:4], 16), 0).index
-            device = self.devices.elements.get(device_id)
-            if device:
-                LOG.warning(
-                    "Timeout communicating with UPB device '%s' (%s)",
-                    device.name,
-                    device_id,
-                )
-            else:
-                LOG.warning("Timeout communicating with UPB device %s", device_id)
+            LOG.warning("Timeout communicating with UPB device %s", device_id)
 
     def add_sync_handler(self, sync_handler):
         """Register a fn that synchronizes elements."""

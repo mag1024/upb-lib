@@ -80,28 +80,31 @@ class MessageDecode:
         """ Decode a UPB message, and invoke appropriate handlers """
         message = self.decode(msg)
         self.call_handlers(message.msg_id, message)
+        return (message.network_id, message.src_id, message.tx_count + 1)
 
+def _update_checksum(msg):
+    msg[-1] = (256 - reduce(lambda x, y: x + y, msg)) % 256
+    return msg
 
 class MessageEncode:
     """Encodes UPB commands."""
 
-    def __init__(self, tx_count):
+    def __init__(self, get_tx_count):
         """Initialize a new MessageEncode instance."""
-        self.tx_count = tx_count
+        self.get_tx_count = get_tx_count
 
-    def _create_control_word(self, link, repeater=0, ack=0):
+    def _create_control_word(self, addr, repeater=0, ack=0):
         """Create a control word in UPB message."""
-        ctl = (1 if link else 0) << 15
-        ctl = ctl | (repeater << 13)
-        ctl = ctl | (ack << 4)
+        ctl = (1 if addr.is_link else 0) << 15
+        ctl |= (repeater << 13)
+        ctl |= (ack << 4)
         # Value of 00 corresponds to 1 transmit.
-        ctl = ctl | (self.tx_count - 1 << 2)
-        ctl = ctl | 0
+        ctl |= (self.get_tx_count(addr.network_id, addr.upb_id) - 1 << 2)
         return ctl
 
     def _encode_message(self, ctl, addr, src_id, msg_code, data=""):
         """Encode a message for the PIM, assumes data formatted"""
-        ctl = self._create_control_word(addr.is_link) if ctl == -1 else ctl
+        ctl = self._create_control_word(addr) if ctl == -1 else ctl
         length = 7 + len(data)
         ctl = ctl | (length << 8)
         msg = bytearray(length)
@@ -112,8 +115,21 @@ class MessageEncode:
         msg[5] = msg_code
         if data:
             msg[6 : len(data) + 6] = data
-        msg[-1] = (256 - reduce(lambda x, y: x + y, msg)) % 256  # Checksum
-        return msg.hex().upper()
+        return _update_checksum(msg).hex().upper()
+
+    @staticmethod
+    def increment_tx_count(hex_msg):
+        msg = bytearray.fromhex(hex_msg)
+        ctl = msg[1]
+        tx_count = (ctl >> 2) & 3
+        if tx_count == 3:
+            return hex_msg
+        ctl &= ~(3 << 2)  # clear old tx count
+        ctl |= (tx_count + 1 << 2)
+        msg[1] = ctl
+        msg[-1] = 0
+        new_msg = _update_checksum(msg).hex().upper()
+        return new_msg
 
     def activate_link(self, addr, ctl=-1):
         """Activate link"""

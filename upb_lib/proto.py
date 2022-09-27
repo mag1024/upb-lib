@@ -2,8 +2,9 @@
 
 import asyncio
 import logging
+from collections import namedtuple
 
-from .const import PimCommand
+from .message import MessageEncode
 
 LOG = logging.getLogger(__name__)
 PIM_BUSY_TIMEOUT = 0.10
@@ -20,10 +21,10 @@ PIM_TO_BE_READY = 3
 class _Packet:
     """Details about a packet being sent"""
 
-    def __init__(self, command, data, response, timeout):
+    def __init__(self, command, data, destination, timeout):
         self.command = command
         self.data = data
-        self.response = response
+        self.destination = destination
         self.timeout = timeout
         self.retry_count = PROTO_RETRY_COUNT
 
@@ -34,14 +35,15 @@ class _Packet:
 class Connection(asyncio.Protocol):
     """asyncio Protocol with line parsing and queuing writes"""
 
-    # pylint: disable=too-many-instance-attributes, too-many-arguments
-    def __init__(self, loop, heartbeat, connected, disconnected, got_data, timeout):
+    Callbacks = namedtuple(
+            "Callbacks",
+            "connected disconnected got_data timeout")
+
+    # pylint: disable=too-many-instance-attributes
+    def __init__(self, loop, callbacks: Callbacks, heartbeat_timeout_sec: float):
         self.loop = loop
-        self._heartbeat_time = heartbeat
-        self._connected_callback = connected
-        self._disconnected_callback = disconnected
-        self._got_data_callback = got_data
-        self._timeout_callback = timeout
+        self._heartbeat_timeout_sec = heartbeat_timeout_sec
+        self._callbacks = callbacks
 
         self._last_message = bytearray()
         self._last_sequence = 0
@@ -57,14 +59,14 @@ class Connection(asyncio.Protocol):
     def connection_made(self, transport):
         LOG.debug("connected callback")
         self._transport = transport
-        self._connected_callback(self)
+        self._callbacks.connected(self)
 
     def connection_lost(self, exc):
         LOG.debug("disconnected callback")
         self._transport = None
         self._cleanup()
-        if self._disconnected_callback:
-            self._disconnected_callback()
+        if self._callbacks.disconnected:
+            self._callbacks.disconnected()
 
     def close(self):
         """Stop the connection from sending/receiving/reconnecting."""
@@ -86,10 +88,10 @@ class Connection(asyncio.Protocol):
         """Restart the connection from sending/receiving."""
         self._paused = False
 
-    def write_data(self, command, data, response_required=True, timeout=5.0):
+    def write_data(self, command, data, response_required=True, timeout=1.0):
         """Queue data and process the write queue."""
-        response = data[4:8] if response_required else None
-        pkt = _Packet(command, data, response, timeout)
+        destination = data[4:8] if response_required else None
+        pkt = _Packet(command, data, destination, timeout)
         self._write_queue.append(pkt)
         LOG.debug("queued write '%s'", pkt.data)
         self._process_write_queue()
@@ -109,7 +111,9 @@ class Connection(asyncio.Protocol):
         )
         if pkt.retry_count == 0:
             self._write_queue.pop(0)
-            self._timeout_callback(kind, pkt.response)
+            self._callbacks.timeout(kind, pkt.destination)
+        else:
+            pkt.data = MessageEncode.increment_tx_count(pkt.data)
 
         pkt.retry_count -= 1
 
@@ -151,12 +155,12 @@ class Connection(asyncio.Protocol):
         if self._awaiting == UPB_PACKET:
             if self._write_queue:
                 response_from = f"{line[6:8]}{line[10:12]}"
-                if response_from == self._write_queue[0].response:
+                if response_from == self._write_queue[0].destination:
                     self._done_with_write_queue_head()
             else:
                 self._done_with_write_queue_head()
 
-        self._got_data_callback(msg)
+        self._callbacks.got_data(msg)
 
     def _cancel_heartbeat_timer(self):
         if self._heartbeat_timeout_task:
@@ -168,9 +172,9 @@ class Connection(asyncio.Protocol):
 
     def _restart_heartbeat_timer(self):
         self._cancel_heartbeat_timer()
-        if self._heartbeat_time > 0:
+        if self._heartbeat_timeout_sec > 0:
             self._heartbeat_timeout_task = self.loop.call_later(
-                self._heartbeat_time, self._heartbeat_timeout
+                self._heartbeat_timeout_sec, self._heartbeat_timeout
             )
 
     def data_received(self, data):
@@ -193,7 +197,7 @@ class Connection(asyncio.Protocol):
                 self._done_with_write_queue_head()
             elif pim_command == "~~":
                 # Received when connected to ser2tcp (github.com/gwww/ser2tcp)
-                self._got_data_callback(line)
+                self._callbacks.got_data(line)
 
         if pim_busy:
             LOG.debug("PIM busy received, retrying in %s seconds", PIM_BUSY_TIMEOUT)
@@ -210,7 +214,7 @@ class Connection(asyncio.Protocol):
 
         pkt = self._write_queue[0]
         self._start_pim_timer(pkt.timeout, self._response_timeout)
-        self._awaiting = UPB_PACKET if pkt.response else PIM_RESPONSE_MESSAGE
+        self._awaiting = UPB_PACKET if pkt.destination else PIM_RESPONSE_MESSAGE
 
         LOG.debug("write_data '%s'", pkt.data)
         pim_command = pkt.command.value if pkt.command else ""
